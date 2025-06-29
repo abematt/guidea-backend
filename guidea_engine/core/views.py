@@ -6,49 +6,155 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth.models import User
+import hashlib
 
-from .models import Document, Location
-from .serializers import DocumentSerializer, UserRegistrationSerializer, UserSerializer
-from .utils.markdown_parser import extract_locations_from_document
+from .models import Location, TextSnippet, AudioSnippet, Tour
+from .serializers import (
+    LocationSerializer, TextSnippetSerializer, AudioSnippetSerializer, 
+    TourSerializer, UserRegistrationSerializer, UserSerializer
+)
 
-class DocumentViewSet(viewsets.ModelViewSet):
-    queryset = Document.objects.all()
-    serializer_class = DocumentSerializer
-    permission_classes = [IsAuthenticated]  # Require authentication
 
-    @action(detail=True, methods=['post'], url_path='parse-locations')
-    def parse_locations(self, request, pk=None):
+class LocationViewSet(viewsets.ModelViewSet):
+    queryset = Location.objects.all()
+    serializer_class = LocationSerializer
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=True, methods=['post'], url_path='generate-snippets')
+    def generate_snippets(self, request, pk=None):
+        """Generate text snippets of different lengths from the location's raw_text"""
         try:
-            document = self.get_object()
-        except Document.DoesNotExist:
-            return Response({'error': 'Document not found'}, status=status.HTTP_404_NOT_FOUND)
+            location = self.get_object()
+        except Location.DoesNotExist:
+            return Response({'error': 'Location not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        dry_run = request.query_params.get('dry_run') == 'true'
-        locations_data = extract_locations_from_document(document.raw_md)
+        # Clear existing snippets for this location
+        TextSnippet.objects.filter(location=location).delete()
 
-        if dry_run:
-            return Response({
-                'dry_run': True,
-                'parsed_locations': locations_data,
-                'message': 'No locations saved. This was a dry run.'
-            }, status=status.HTTP_200_OK)
+        # Generate snippets (this is a placeholder - you'd implement actual text processing)
+        snippets_created = []
+        raw_text = location.raw_text
 
-        # Clear old and save new
-        Location.objects.filter(document=document).delete()
+        for length_choice, length_display in TextSnippet.LENGTH_CHOICES:
+            # Simple text truncation logic (you'd want more sophisticated processing)
+            if length_choice == 'short':
+                text = raw_text[:200] + '...' if len(raw_text) > 200 else raw_text
+            elif length_choice == 'medium':
+                text = raw_text[:500] + '...' if len(raw_text) > 500 else raw_text
+            else:  # long
+                text = raw_text
 
-        for loc in locations_data:
-            Location.objects.create(
-                document=document,
-                name=loc['name'],
-                latlon_json=loc.get('latlon_json', {}),
+            # Create hash for change detection
+            text_hash = hashlib.md5(text.encode()).hexdigest()
+
+            snippet = TextSnippet.objects.create(
+                location=location,
+                length=length_choice,
+                text=text,
+                hash=text_hash,
+                is_current=True
             )
+            snippets_created.append({
+                'id': snippet.id,
+                'length': length_choice,
+                'text_preview': text[:100] + '...' if len(text) > 100 else text
+            })
 
         return Response({
-            'created': len(locations_data),
-            'saved': True,
-            'locations': locations_data
-        }, status=status.HTTP_200_OK)
+            'message': f'Generated {len(snippets_created)} text snippets',
+            'snippets': snippets_created
+        }, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=['get'], url_path='snippets')
+    def get_snippets(self, request, pk=None):
+        """Get all text snippets for this location"""
+        try:
+            location = self.get_object()
+        except Location.DoesNotExist:
+            return Response({'error': 'Location not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        snippets = TextSnippet.objects.filter(location=location).order_by('length')
+        serializer = TextSnippetSerializer(snippets, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='nearby')
+    def nearby_locations(self, request):
+        """Get locations near specified coordinates (placeholder for future implementation)"""
+        lat = request.query_params.get('lat')
+        lon = request.query_params.get('lon')
+        radius = request.query_params.get('radius', 10)  # km
+
+        if not lat or not lon:
+            return Response({'error': 'lat and lon parameters required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Placeholder - you'd implement actual geographic search here
+        locations = Location.objects.all()[:10]  # Return first 10 for now
+        serializer = LocationSerializer(locations, many=True)
+        return Response({
+            'message': f'Locations within {radius}km of ({lat}, {lon})',
+            'locations': serializer.data
+        })
+
+
+class TextSnippetViewSet(viewsets.ModelViewSet):
+    queryset = TextSnippet.objects.all()
+    serializer_class = TextSnippetSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = TextSnippet.objects.all()
+        location_id = self.request.query_params.get('location_id')
+        if location_id:
+            queryset = queryset.filter(location_id=location_id)
+        return queryset.order_by('-created')
+
+
+class AudioSnippetViewSet(viewsets.ModelViewSet):
+    queryset = AudioSnippet.objects.all()
+    serializer_class = AudioSnippetSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = AudioSnippet.objects.all()
+        location_id = self.request.query_params.get('location_id')
+        if location_id:
+            queryset = queryset.filter(text_snippet__location_id=location_id)
+        return queryset.order_by('-created')
+
+
+class TourViewSet(viewsets.ModelViewSet):
+    queryset = Tour.objects.all()
+    serializer_class = TourSerializer
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=True, methods=['post'], url_path='add-location')
+    def add_location(self, request, pk=None):
+        """Add a location to the tour"""
+        tour = self.get_object()
+        location_id = request.data.get('location_id')
+        
+        if not location_id:
+            return Response({'error': 'location_id required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            location = Location.objects.get(id=location_id)
+        except Location.DoesNotExist:
+            return Response({'error': 'Location not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Add location to tour order
+        location_order = tour.location_order_json or []
+        if location_id not in location_order:
+            location_order.append(location_id)
+            tour.location_order_json = location_order
+            tour.save()
+
+        return Response({
+            'message': f'Added location "{location.name}" to tour',
+            'location_order': location_order
+        })
+
+
+# Keep existing authentication views
 class RegisterView(APIView):
     permission_classes = [AllowAny]
 
@@ -65,13 +171,13 @@ class RegisterView(APIView):
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
 class LoginView(TokenObtainPairView):
     permission_classes = [AllowAny]
 
     def post(self, request, *args, **kwargs):
         response = super().post(request, *args, **kwargs)
         if response.status_code == 200:
-            # Get user data
             username = request.data.get('username')
             try:
                 user = User.objects.get(username=username)
@@ -81,6 +187,7 @@ class LoginView(TokenObtainPairView):
             except User.DoesNotExist:
                 pass
         return response
+
 
 class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
@@ -93,6 +200,7 @@ class LogoutView(APIView):
             return Response({'message': 'Logout successful'}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': 'Invalid token'}, status=status.HTTP_400_BAD_REQUEST)
+
 
 class UserProfileView(APIView):
     permission_classes = [IsAuthenticated]
@@ -107,3 +215,19 @@ class UserProfileView(APIView):
             serializer.save()
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class UserView(APIView):
+    """
+    Simple endpoint to get current user information
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user_data = {
+            'username': request.user.username,
+            'email': request.user.email,
+            'first_name': request.user.first_name,
+            'last_name': request.user.last_name,
+        }
+        return Response(user_data)
